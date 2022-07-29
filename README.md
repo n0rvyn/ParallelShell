@@ -21,6 +21,7 @@ Modules:
         [-u USER[s]] [-p PASSWORD[s]]
         <-a ADDRESS[es]> <-g GATEWAY[s]>
         [-r | --default-route] [-w | --restart-network]
+        [-o | --bond]
         [--preview]
 	mminit.py ifcfg    
 		<-h HOST[s]>   
