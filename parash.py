@@ -39,9 +39,9 @@ except ModuleNotFoundError:
 
 _HOME_ = os.path.abspath(os.path.dirname(__file__))
 _LOG_PATH_ = os.path.join(_HOME_, '.')
-_LOG_FILE_ = os.path.join(_LOG_PATH_, 'gpfs_inst.log')
+_LOG_FILE_ = os.path.join(_LOG_PATH_, '_parallel_shell.log')
 
-PREVIEW = True
+PREVIEW = False
 # set to True creating file system for GPFS cluster
 MMCRFS = False
 # define parameters for GPFS cluster creation
@@ -647,9 +647,12 @@ class MultiTerm(object):
 
     def assign_ip_to_nic_thread(self, *ip_addr_with_prefix, gateways: str,
                                 default_route=False, add_static_routes=False,
+                                bond=False,
                                 nic_prefix=None, nic_ignore_prefix=None,
                                 restart_network=False, backup=False, preview=True):
         """
+        This method is deprecated, use 'assign_ip' instead.
+
         try assign IP addresses to each NIC on the host with command 'ip addr add IP_ADDR dev NIC',
         then test connection to the gateway specified with command 'ping -c1 -W1 -I DEV GATEWAY',
         if ip_addr assign to the NIC pass the test, write permanent configuration ifcfg-DEV.
@@ -658,6 +661,7 @@ class MultiTerm(object):
             gateways: all gateways of subnet, order insensitive '192.168.1.1, 172.16.1.1'
             default_route: set to True if the gateway specified is default route
             add_static_routes: set to True adding static route for these subnets
+            bond: set to True configure BOND interface
             nic_prefix: the same prefix string of NICs you wanted, type: strings split with blank
                         'ens' or 'ens enp'
                         nic_prefix has the most high priority
@@ -771,6 +775,267 @@ class MultiTerm(object):
             [_term.getoutput(f'echo {_line} >> {_ifcfg_file}') for _line in _ifcfg_txt] if not preview else []
 
             _return.update({_term.host: (_address_with_prefix, _perfect_nic, _ip_on_perfect_nic.strip())})
+            return True
+
+        # end of IP assign target defination
+
+        # add static routes threading target
+        def _add_static_routes_target(_term: PyTermAutoSelect, _addrs_with_prefix, _gateway):
+
+            _target_subnet_ids = list(set([ipcalc(_addr)[0] for _addr in _addrs_with_prefix]))
+            _config_file = '/etc/sysconfig/static-routes'
+            _static_routes = []
+
+            for _net_id in _target_subnet_ids:
+                _add_route_command = f'route add -net {_net_id} gw {_gateway}'
+                _return_code = _term.getstatusoutput(_add_route_command)[0]  # add temporary route
+
+                if _return_code == 0:  # append static routes ONLY those can be added by command 'route add -net'
+                    _static_routes.append(f'any net {_net_id} gw {_gateway}')
+
+            for _route in _static_routes:
+                _script = f"""if ! grep "{_route}" {_config_file}; then echo "{_route}" >> {_config_file}; fi"""
+                _term.getoutput(_script)
+
+        # end of static routes adding target defination
+
+        _thread = [threading.Thread(target=_assign_ip_target,
+                                    args=(_term,
+                                          _host_with_ip_gw[_term.host][0],
+                                          _host_with_ip_gw[_term.host][1],
+                                          default_route,
+                                          _all_hosts_nic[_term.host]
+                                          )
+                                    )
+                   for _term in self.terms]
+
+        [_t.start() for _t in _thread]
+        [_t.join() for _t in _thread]
+
+        if add_static_routes:  # auto add static routes ONLY the parameter is set to True
+            _thread_routes = [threading.Thread(target=_add_static_routes_target,
+                                               args=(_term,
+                                                     ip_addr_with_prefix,
+                                                     _host_with_ip_gw[_term.host][1]
+                                                     )
+                                               )
+                              for _term in self.terms]
+
+            [_t.start() for _t in _thread_routes]
+            [_t.join() for _t in _thread_routes]
+
+        if restart_network:
+            self.logger.colorlog('restart_network is set to True, restart the service', 'info')
+            self.getstatusoutput_thread('systemctl restart network')
+
+        return _return
+
+    def assign_ip(self, *ip_addr_with_prefix, gateways: str,
+                  default_route=False, add_static_routes=False,
+                  bonding=False, bonding_mode=1,
+                  nic_prefix=None, nic_ignore_prefix=None,
+                  restart_network=False, backup=False, preview=True):
+        """
+        try assign IP addresses to each NIC on the host with command 'ip addr add IP_ADDR dev NIC',
+        then test connection to the gateway specified with command 'ping -c1 -W1 -I DEV GATEWAY',
+        if ip_addr assign to the NIC pass the test, write permanent configuration ifcfg-DEV.
+        Args:
+            ip_addr_with_prefix: 192.168.1.1/24
+            gateways: all gateways of subnet, order insensitive '192.168.1.1, 172.16.1.1'
+            default_route: set to True if the gateway specified is default route
+            add_static_routes: set to True adding static route for these subnets
+            bonding: set to True configure BOND interface
+            bonding_mode: 1 -> active-backup; 5 -> balance-tlb ...
+            nic_prefix: the same prefix string of NICs you wanted, type: strings split with blank
+                        'ens' or 'ens enp'
+                        nic_prefix has the most high priority
+            nic_ignore_prefix: the prefix of NIC need to be ignored, type: strings split with blank
+                        'vir' or 'vir eth'
+            restart_network: set to True restart service 'network'
+            backup: set to True backup NIC configuration 'ifcfg-ens32'
+            preview: set to False write ifcfg file
+
+        Returns: [(ip_addr, correct_nic)...]
+        """
+        _return = {}
+
+        # every IP address has 3 dots, otherwise exit with exception raised
+        assert len(ip_addr_with_prefix) * 3 == ''.join(ip_addr_with_prefix).count('.')
+        gateway_list = [_gw.strip() for _gw in gateways.split(',')]
+        assert len(gateway_list) * 3 == gateways.count('.')
+
+        def _choose_gw_for_addr(_address_with_prefix, _gateway_list: list):
+            """
+            choose correct GATEWAY for IP address from _gateway_list
+            """
+            _net_id, _host_min, _host_max, *_ = ipcalc(_address_with_prefix)
+
+            for _gw in _gateway_list:
+                _part_gw = _gw.split('.')
+                _part_min = _host_min.split('.')
+                _part_max = _host_max.split('.')
+
+                if _part_gw[0:3] == _part_min[0:3] == _part_max[0:3] and _part_min[3] <= _part_gw[3] <= _part_max[3]:
+                    return _gw
+
+            return '0.0.0.0'
+
+        # {_term.host: (address_to_assign, gateway), ...}
+        try:
+            _host_with_ip_gw = {self.terms[_index].host: (ip_addr_with_prefix[_index],
+                                                          _choose_gw_for_addr(ip_addr_with_prefix[_index],
+                                                                              gateway_list)
+                                                          )
+                                for _index in range(len(self.terms))
+                                }
+        except IndexError:
+            self.logger.colorlog('number of IPs not equal to number of TERMs, return False', 'error')
+            return _return
+
+        _all_hosts_nic = self.fetch_nic_thread(nic_prefix, nic_ignore_prefix)
+
+        # define threading target for assigning IP to host
+        def _assign_ip_target(_term: PyTermAutoSelect,
+                              _address_with_prefix,
+                              _gateway,
+                              _default_route,
+                              _nics,
+                              _bonding=bonding,
+                              _mode=bonding_mode):
+            _perfect_nic = None
+            _bond_name = None
+            _bond_nic = []
+            _ifcfg_path = '/etc/sysconfig/network-scripts/'
+
+            def __write_config(__interface_name, __ifcfg_line: list, __backup_config=backup):
+                __ifcfg_file = os.path.join(_ifcfg_path, f'ifcfg-{__interface_name}')
+                __ifcfg_backup_file = os.path.join(_ifcfg_path, f'bak.ifcfg-{__interface_name}.`date +%m%d%H%M%S`')
+
+                # backup the NIC exist configuration if 'backup' is set to True
+                __backup_command = f"""mv {__ifcfg_file} {__ifcfg_backup_file}"""
+                if __backup_command:
+                    _term.getoutput(__backup_command)
+                else:
+                    _term.getoutput(f'>{__ifcfg_file}')  # clean the configuration of __interface_name
+
+                # fetch IP address on first suitable NIC before write ifcfg file
+                __ip_on_interface = _term.getoutput(
+                    f'''ip addr show dev {__interface_name} 2>/dev/null | grep -oE "[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/[0-9]*" | tr "\\n" " "''')
+                # write the configuration to file if parameter 'preview' is set to False
+                [_term.getoutput(f'echo {_line} >> {__ifcfg_file}') for _line in __ifcfg_line] if not preview else []
+
+                return __ip_on_interface
+
+            # end of sub method defination
+
+            try:
+                _addr, _prefix = _address_with_prefix.split('/')
+            except ValueError:
+                return _return
+
+            for _nic in _nics:
+                _ip_fit_nic_script_1 = f"""ip addr add {_address_with_prefix} dev {_nic}"""
+                _ip_fit_nic_script_2 = f"""ip link set {_nic} up"""
+                _ip_fit_nic_script_3 = f"""ping -c1 -W2 -I {_nic} {_gateway}"""
+                _ip_fit_nic_script_4 = f"""ip addr del {_address_with_prefix} dev {_nic}"""
+
+                _code_ip_add, _output = _term.getstatusoutput(_ip_fit_nic_script_1)
+                _term.getoutput(_ip_fit_nic_script_2)
+                _return_code, _output = _term.getstatusoutput(_ip_fit_nic_script_3)
+
+                # never delete the ip if it exists before 'ip addr add' command executed
+                # do not delete the ip if met the fit NIC after 'ip addr add'
+                # _term.getoutput(_ip_fit_nic_script_4) if _code_ip_add == 0 else ''
+                # delete address on local NIC if bonding=True, otherwise 2nd NIC not connectable!!!
+                if _code_ip_add == 0 and (_return_code != 0 or preview or bonding):
+                    _term.getoutput(_ip_fit_nic_script_4)
+                # _term.getoutput(_ip_fit_nic_script_4) if _code_ip_add == 0 and _return_code != 0 else ''
+
+                if _return_code == 0:
+                    _perfect_nic = _nic if _nic != '' else _perfect_nic
+                    _msg = f'[{_term.host}] met perfect NIC [{_perfect_nic}] for [{_address_with_prefix}]'
+                    self.logger.colorlog(_msg, 'info')
+
+                    if not _bonding:
+                        break
+                    else:
+                        _bond_nic.append(_perfect_nic) if _perfect_nic is not None else ''
+                        continue
+
+            if _perfect_nic is None:
+                self.logger.colorlog(f'[{_term.host}] no suitable NIC found for {_address_with_prefix}', 'error')
+                return False
+
+            # todo name bond0
+            _name_a_bond = f'''echo $((`ls {_ifcfg_path}/ifcfg-bond* 2>/dev/null | grep -Eo "[0-9]$" | sort -h | tail -1`+1))'''
+            if _bonding:
+                _bond_name = f'bond{_term.getoutput(_name_a_bond)}'
+                _bond_name = 'bond0' if _bond_name == 'bond' else _bond_name
+
+                if len(_bond_nic) != 2:
+                    self.logger.colorlog(f'less then 2 interface <{_bond_nic}> is connectable '
+                                         f'for bonding interface [{_bond_name}] '
+                                         f'of host [{_term.host}]', 'warn')
+                    return False
+
+                _ifcfg_bond = [
+                    f'DEVICE={_bond_name}',
+                    'TYPE=Bond',
+                    f'NAME={_bond_name}',
+                    'BONDING_MASTER=yes',
+                    'BOOTPROTO=none',
+                    'ONBOOT=yes',
+                    f'BONDING_OPTS="mode={_mode} miimon=100"',
+                    f'PRIMARY={_bond_nic[0]}',
+                    f'IPADDR={_addr}',
+                    f'PREFIX={_prefix}',
+                    f'GATEWAY={_gateway}' if _default_route is True else ''
+                ]
+
+                _ifcfg_slave_1 = [
+                    'TYPE=Ethernet',
+                    'BOOTPROTO=none',
+                    f'DEVICE={_bond_nic[0]}',
+                    'ONBOOT=yes',
+                    f'MASTER={_bond_name}',
+                    'SLAVE=yes'
+                ]
+
+                _ifcfg_slave_2 = [
+                    'TYPE=Ethernet',
+                    'BOOTPROTO=none',
+                    f'DEVICE={_bond_nic[1]}',
+                    'ONBOOT=yes',
+                    f'MASTER={_bond_name}',
+                    'SLAVE=yes'
+                ]
+
+                _ip_on_bond = __write_config(_bond_name, _ifcfg_bond)
+                __write_config(_bond_nic[0], _ifcfg_slave_1)
+                __write_config(_bond_nic[1], _ifcfg_slave_2)
+
+                _return.update({_term.host: (_address_with_prefix,
+                                             f'{_bond_name}/{_bond_nic[0]}/{_bond_nic[1]}',
+                                             _ip_on_bond.strip())})
+
+            else:
+                # configuration for non-bonding interface
+                _ifcfg_txt = [
+                    'TYPE=Ethernet',
+                    'BOOTPROTO=static',
+                    f'NAME={_perfect_nic}',
+                    f'DEVICE={_perfect_nic}',
+                    'ONBOOT=yes',
+                    f'IPADDR={_addr}',
+                    f'PREFIX={_prefix}',
+                    f'GATEWAY={_gateway}' if _default_route is True else ''
+                ]
+
+                _ip_on_nic = __write_config(_perfect_nic, _ifcfg_txt)
+                _return.update({_term.host: (_address_with_prefix,
+                                             _perfect_nic,
+                                             _ip_on_nic.strip())})
+
             return True
 
         # end of IP assign target defination
@@ -1026,7 +1291,7 @@ def module_ipcalc(*args):
 
 def module_multerm(*args):
     _end = ('exit', 'quit', 'q')
-    _command_ignore = ('top', 'man')
+    _command_ignore = ('top', 'man', 'vi')
 
     _multi_term = MultiTerm(*args)
     _origin_multi_term = _multi_term
@@ -1113,7 +1378,7 @@ def module_multerm(*args):
 
         for _host, _code_output in _multi_term.getstatusoutput_thread(_command).items():
             _code, _output = _code_output
-            print('-'*40, f'{_host:^15s} {_code:^3d}', '-'*40)
+            print('-' * 40, f'{_host:^15s} {_code:^3d}', '-' * 40)
             print(_output)
 
 
@@ -1136,6 +1401,7 @@ Modules:
         [-u USER[s]] [-p PASSWORD[s]]
         <-a ADDRESS[es]> <-g GATEWAY[s]>
         [-r | --default-route] [-w | --restart-network]
+        [-o | --bond]
         [--preview]
     {_FILENAME_} ifcfg 
         <-h HOST[s]> 
@@ -1173,6 +1439,7 @@ Options:
   -t, --default-route   set the GATEWAY specified default 
   -r, --restart-network restart service 'network' via command 'systemctl restart network' 
   -i INTERFACE          name of network interface card
+  -o, --bond            create bond configuration if more than 2 NICs suitable for the address
 
   For module gpfs only:
   -s ADDRESSES          service IP addresses '192.168.1.1/2, 192.168.2.1/2'
@@ -1209,9 +1476,10 @@ def read_args():
 
     hosts = passwords = addresses = []
     users = ['root']
-    gateways = None
+    gateways = ''
     default_route = False
     restart_network = False
+    bonding = False
     interface = ''
     show = False
 
@@ -1228,8 +1496,9 @@ def read_args():
         # option has a value h:
         # long option has value 'long-args='
         opts, args = getopt.getopt(options,
-                                   'h:u:p:a:g:s:b:n:x:f:m:d:P:S:Q:rwi:',
-                                   ['preview', 'help', 'default-route', 'restart-network', 'show'])
+                                   'h:u:p:a:g:s:b:n:x:f:m:d:P:S:Q:rwi:o',
+                                   ['preview', 'help', 'default-route',
+                                    'restart-network', 'show', 'bond'])
 
         for _opt, _arg in opts:
             _arg_list = _arg.split(',')
@@ -1247,6 +1516,8 @@ def read_args():
                 default_route = True
             elif _opt in ['-r', '--restart-network']:
                 restart_network = True
+            elif _opt in ['-o', '--bond']:
+                bonding = True
             elif _opt == '-i':
                 interface = f'dev {_arg}'
             elif _opt == '--show':
@@ -1307,16 +1578,24 @@ def read_args():
 
             if show:
                 for _host, _info in _multi_term.getoutput_thread(f'ip addr show {interface}').items():
-                    print('-'*40, f'{_host:^15s}', '-'*40)
+                    print('-' * 40, f'{_host:^15s}', '-' * 40)
                     print(_info)
                 exit(0)
 
             print('\nAs option "--preview" is set, nothing will be changed.\n') if PREVIEW else ''
-            _result = _multi_term.assign_ip_to_nic_thread(*addresses,
-                                                               gateways=gateways,
-                                                               default_route=default_route,
-                                                               restart_network=restart_network,
-                                                               preview=PREVIEW)
+            # _result = _multi_term.assign_ip_to_nic_thread(*addresses,
+            #                                               gateways=gateways,
+            #                                               default_route=default_route,
+            #                                               restart_network=restart_network,
+            #                                               preview=PREVIEW)
+
+            _result = _multi_term.assign_ip(*addresses,
+                                            gateways=gateways,
+                                            default_route=default_route,
+                                            restart_network=restart_network,
+                                            preview=PREVIEW,
+                                            bonding=bonding,
+                                            backup=True)
 
             for _host, _ip_after_nic_ip_before in _result.items():
                 _ip_after, _nic, _ip_before = _ip_after_nic_ip_before
@@ -1340,4 +1619,5 @@ def read_args():
 if __name__ == '__main__':
     read_args()
 
-    exit(0)
+
+
