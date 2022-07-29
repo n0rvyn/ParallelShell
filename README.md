@@ -280,10 +280,3 @@ mminit.py ipcalc 192.168.0.1/255.255.255.0
 mminit.py ipcalc 192.168.0.1 255.255.255.0 
 mminit.py ifcfg -l 192.168.1.1/2 -o 10.10.10.1/2=28 -g '10.10.10.14' -s 'PASS'
 ```
-
-#### 示例：
-
-![[Screen Shot 2022-07-24 at 16.29.08.png]]
-![[Screen Shot 2022-07-24 at 16.38.27.png]]
-![[Screen Shot 2022-07-24 at 16.41.08.png]]
-![[Screen Shot 2022-07-24 at 16.43.29.png]]
