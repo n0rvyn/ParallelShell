@@ -16,8 +16,7 @@
 ---And setup GPFS cluster & filesystem---
 """
 
-# todo add a todo list for procedure
-# such as [(stage1, done), (stage2, null)]
+# todo add CTRL-C signal to method getoutput()
 
 import logging
 import os
@@ -27,6 +26,9 @@ import threading
 import time
 from getpass import getpass
 import getopt
+import socket
+from yaml import safe_load
+from yaml import dump
 
 # define a parameter to decide weather initialize remote terminal with OpenSSH or paramiko
 OPENSSH = True
@@ -42,12 +44,10 @@ _LOG_PATH_ = os.path.join(_HOME_, '.')
 _LOG_FILE_ = os.path.join(_LOG_PATH_, '_parallel_shell.log')
 
 PREVIEW = False
-# set to True creating file system for GPFS cluster
-MMCRFS = False
 # define parameters for GPFS cluster creation
-NODE_PREFIX = 'gpfs-'
-MOUNT_POINT = '/home/app/data'
-FS_NAME = 'gpfs_data'
+DEF_NODE_PREFIX = 'gpfs-'
+DEF_MOUNT_POINT = '/home/app/data'
+DEF_FS_NAME = 'gpfs_data'
 
 
 class ColorLogFormatter(logging.Formatter):
@@ -158,10 +158,6 @@ class PyTermOpenSSH(object):
         command = f'{command}; echo " $? EOT"\n'.encode()  # output of command does end with New Line
         # EOT\n is for subprocess.Popen stdin flush ENTER, not part of echo arguments
         self.logger.colorlog(f'send command [{command}] to terminal', 'info')
-        # todo bug:
-        #   if output of command not endswith '\n'
-        #   then RETURN_CODE EOT takes the same line with output
-        #   the line contains available strings will be recognised as EOT and ignored
         """
         # cat /proc/net/dev | grep -E ".*[0-9][0-9]*" | awk '{printf $1}'; echo $? EOT
         ens35:ens32:ens34:lo:virbr0-nic:virbr0:0 EOT
@@ -234,6 +230,7 @@ class PyTermParamiko(object):
         self.term = None
         self.connected = False
         self.retry = retry
+        self.pass_failed = False
 
         self.last_return_code = 0
 
@@ -253,14 +250,21 @@ class PyTermParamiko(object):
 
         except paramiko.ssh_exception.AuthenticationException as _e:
             self.logger.colorlog(_e, 'critical')
+            self.pass_failed = True
         except paramiko.ssh_exception.BadHostKeyException as _e:
             self.logger.colorlog(_e, 'critical')
             self.logger.colorlog('remove all keys belonging to host from known_hosts file', 'warn')
             os.system(f'ssh-keygen -R {self.host}')
         except paramiko.ssh_exception.NoValidConnectionsError as _e:
             self.logger.colorlog(_e, 'critical')
-            print(_e)
+            print(f'[{self.host}] not reachable.')
             self.retry = 0
+        except socket.timeout as _e:
+            self.logger.colorlog(_e, 'critical')
+            print(f'[{self.host}] SSH connection timeout.')
+        except OSError as _e:
+            self.logger.colorlog(_e, 'critical')
+            print(f'[{self.host}] host is down.')
 
         return False
 
@@ -274,7 +278,9 @@ class PyTermParamiko(object):
 
         if not self.connected:
             for i in range(0, self.retry):
-                self.password = getpass(f'Authorise failed, input password for host [{self.host}] usr [{self.user}]: ')
+                if self.pass_failed:  # only if got wrong password then try to read a new one
+                    self.password = getpass(
+                        f'Authorise failed, input password for host [{self.host}] usr [{self.user}]: ')
                 if self.connect_ssh():
                     break
 
@@ -432,26 +438,32 @@ class MultiTerm(object):
         return [(_host, True if _code_output[0] == 0 else False)
                 for _host, _code_output in self.getstatusoutput_thread(command).items()]
 
-    def add_hosts(self, ip: str, host_name: str):
+    def getstatus_sum(self, command: str):
+        return sum([_code_output[0] for _code_output in self.getstatusoutput_thread(command).values()])
+
+    def add_hosts(self, ip: str, host_name: str) -> int:
         """
         append file '/etc/hosts'
-        Returns:    return code of `echo "ip  host" >> /etc/hosts
+        Returns:    sum of all return codes
         """
-        _script = f"""if ! grep "{ip}.*{host_name}" /etc/hosts; then echo "{ip}  {host_name}" >> /etc/hosts; fi"""
+        _add_host = f"""if ! grep "{ip}.*{host_name}" /etc/hosts; then echo "{ip:<15s} {host_name}" >> /etc/hosts; fi"""
         # return self.getstatusoutput(_script)
-        return self.getstatusoutput_thread(_script) if ip != '' and host_name != '' else False
+        # return self.getstatusoutput_thread(_add_host) if ip != '' and host_name != '' else self.getstatusoutput_thread('false')
+        # return self.getstatus_bool(_add_host) if ip != '' and host_name != '' else self.getstatusoutput_thread('false')
+        return self.getstatus_sum(_add_host) if ip != '' and host_name != '' else 127
 
     def add_ssh_key(self, ssh_pub_key):
         """
         Append specified ssh public key to each host
         Args:
             ssh_pub_key: ssh public key string
-        Returns: list of tuples which has two elements: script return code & output
+        Returns: sum of return codes from all hosts
         """
         _ssh_auth_keys_file = '~/.ssh/authorized_keys'
         _script = f"""if ! grep "{ssh_pub_key}" {_ssh_auth_keys_file}; then echo "{ssh_pub_key}" >> {_ssh_auth_keys_file}; fi"""
         # return self.getstatusoutput(_script)
-        return self.getstatusoutput_thread(_script)
+        # return self.getstatusoutput_thread(_script)
+        return self.getstatus_sum(_script)
 
     def gen_ssh_key(self, ssh_key_file=None):
         """
@@ -468,9 +480,9 @@ class MultiTerm(object):
         # return self.getstatusoutput(_script)
         return self.getstatusoutput_thread(_script)
 
-    def _gather_ip_host(self, ip_prefix: str, nodename_prefix=None):
+    def _gather_ip_host(self, ip_prefix, nodename_prefix=None):
         """
-        For generating IP & nodename string list
+        For generating 'IP nodename' string list
         Args:
             ip_prefix: prefix of ip address
             nodename_prefix: prefix of node name adding to host name
@@ -501,32 +513,32 @@ class MultiTerm(object):
             ip_prefix: if more than one ip address is assigned,
                 specified the prefix such as '172.16',
                 so that only ip address startswith '172.16' will be add the the file '/etc/hosts'
-
             nodename_prefix: by default, hostname (except localhost) will be added to the file '/etc/hosts',
                 but if you want a special one different with the hostname,
                 you can set the value to this parameter as a prefix based on `hostname`
-        Returns:
+        Returns: list of host-database if preview is set to True or return codes
 
         """
         _ip_hosts = self._gather_ip_host(ip_prefix, nodename_prefix=nodename_prefix)
+        host_db = []
 
         for _ip_host in _ip_hosts:
             _ip, _host = _ip_host
 
-            if not _ip.split('.')[0].isnumeric():
-                _ip_hosts.remove(_ip_host)
+            # if not _ip.split('.')[0].isnumeric() or _host == 'localhost' or _ip == '':
+            #     _ip_hosts.remove(_ip_host)
+            if _ip.split('.')[0].isnumeric() and _host != 'localhost' and len(_ip.split('.')) == 4:
+                host_db.append((_ip, _host))
 
-            if _host == 'localhost':
-                _ip_hosts.remove(_ip_host)
+        return [self.add_hosts(_ip_host[0], _ip_host[1]) for _ip_host in host_db] if host_db != [] else [-1]
 
-        return [self.add_hosts(_ip_host[0], _ip_host[1]) for _ip_host in _ip_hosts]
-
-    def add_known_hosts(self, *host):
+    def add_known_hosts(self, *host, remove_exist=False):
         """
         Add host[s] to file '~/.ssh/known_hosts'
 
         Args:
-            host: hostname [ or | and ] IP address belonging to the same host
+            host (tuple) - hostname [ or | and ] IP address belonging to the same host
+            remove_exist (bool) - set to True run command 'ssh-keygen -R HOST'
 
         command used:
         # ssh-keygen -R HOSTNAME
@@ -545,31 +557,30 @@ class MultiTerm(object):
                 continue
 
             # remove all keys belonging to the '_host'
+            # return non-zero code is ok because _host not exists in the file
             _script_gen = f"""ssh-keygen -R {_host}"""
+
             # hash the hostname, append to the file
             _script_scan = f"""ssh-keyscan -H {_host} >> ~/.ssh/known_hosts"""
 
-            _return_1 = self.getstatusoutput_thread(_script_gen)
-            _return_2 = self.getstatusoutput_thread(_script_scan)
+            self.getstatusoutput_thread(_script_gen) if remove_exist is True else ''
+            _return_code += self.getstatus_sum(_script_scan)
 
-            # _return_code = sum([_code[1][0] for _code in _return_1])
-            # _return_code += sum([_code[1][0] for _code in _return_2])
-            _return_code = sum([_code[0] for _code in _return_1.values()])
-            _return_code += sum([_code[0] for _code in _return_2.values()])
+        # return True if _return_code == 0 else False
+        return _return_code
 
-        return True if _return_code == 0 else False
-
-    def add_known_hosts_all(self, ip_prefix: str, nodename_prefix=None):
+    def add_known_hosts_all(self, ip_prefix, nodename_prefix=None, remove_exist=False):
         """
         Add IP address with prefix 'ip_prefix' and node_name with prefix 'nodename_prefix' to SSH known_hosts file
         Args:
             ip_prefix:
             nodename_prefix:
+            remove_exist:
 
         Returns:
 
         """
-        _ip_hosts = self._gather_ip_host(ip_prefix, nodename_prefix=nodename_prefix)
+        _ip_hosts = self._gather_ip_host(ip_prefix, nodename_prefix)
 
         for _ip_host in _ip_hosts:
             _ip, _host = _ip_host
@@ -580,7 +591,7 @@ class MultiTerm(object):
             if _host == 'localhost':
                 _ip_hosts.remove(_ip_host)
 
-        return [self.add_known_hosts(_ip_host[0], _ip_host[1]) for _ip_host in _ip_hosts]
+        return [self.add_known_hosts(_ip_host[0], _ip_host[1], remove_exist=remove_exist) for _ip_host in _ip_hosts]
 
     def add_ssh_whitelist(self, address):
         _script = f"""if ! grep "{address}" /etc/hosts.allow; then echo "sshd:{address}" >> /etc/hosts.allow; fi"""
@@ -591,7 +602,7 @@ class MultiTerm(object):
         _hosts = list(set([_i_h[0] for _i_h in _ip_hosts]))
         return [self.add_ssh_whitelist(_host) for _host in _hosts]
 
-    def ssh_authorize_all(self, ssh_key_file=None, add_known_hosts=False):
+    def ssh_authorize_all(self, ssh_key_file=None):
         _ssh_key_file = ssh_key_file if ssh_key_file is not None else '~/.ssh/id_rsa'
         _ssh_pub_key_file = f'{_ssh_key_file}.pub'
 
@@ -919,8 +930,8 @@ class MultiTerm(object):
                     _term.getoutput(f'>{__ifcfg_file}')  # clean the configuration of __interface_name
 
                 # fetch IP address on first suitable NIC before write ifcfg file
-                __ip_on_interface = _term.getoutput(
-                    f'''ip addr show dev {__interface_name} 2>/dev/null | grep -oE "[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/[0-9]*" | tr "\\n" " "''')
+                __show_ip = f'''ip addr show dev {__interface_name} 2>/dev/null | grep -oE "[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/[0-9]*" | tr "\\n" " "'''
+                __ip_on_interface = _term.getoutput(__show_ip)
                 # write the configuration to file if parameter 'preview' is set to False
                 [_term.getoutput(f'echo {_line} >> {__ifcfg_file}') for _line in __ifcfg_line] if not preview else []
 
@@ -949,7 +960,6 @@ class MultiTerm(object):
                 # delete address on local NIC if bonding=True, otherwise 2nd NIC not connectable!!!
                 if _code_ip_add == 0 and (_return_code != 0 or preview or bonding):
                     _term.getoutput(_ip_fit_nic_script_4)
-                # _term.getoutput(_ip_fit_nic_script_4) if _code_ip_add == 0 and _return_code != 0 else ''
 
                 if _return_code == 0:
                     _perfect_nic = _nic if _nic != '' else _perfect_nic
@@ -966,15 +976,14 @@ class MultiTerm(object):
                 self.logger.colorlog(f'[{_term.host}] no suitable NIC found for {_address_with_prefix}', 'error')
                 return False
 
-            # todo name bond0
+            # todo naming a bonding interface to be started from bond0 instead of bond1
             _name_a_bond = f'''echo $((`ls {_ifcfg_path}/ifcfg-bond* 2>/dev/null | grep -Eo "[0-9]$" | sort -h | tail -1`+1))'''
             if _bonding:
                 _bond_name = f'bond{_term.getoutput(_name_a_bond)}'
-                _bond_name = 'bond0' if _bond_name == 'bond' else _bond_name
 
                 if len(_bond_nic) != 2:
-                    self.logger.colorlog(f'less then 2 interface <{_bond_nic}> is connectable '
-                                         f'for bonding interface [{_bond_name}] '
+                    self.logger.colorlog(f'naming a bonding interface [{_bond_name}] failed,'
+                                         f'or less than 2 NIC <{_bond_nic}> is connectable '
                                          f'of host [{_term.host}]', 'warn')
                     return False
 
@@ -1126,6 +1135,16 @@ class MultiTerm(object):
             """sed -i 's/#useDNS yes/useDNS no/g' /etc/ssh/sshd_config && systemctl restart sshd""")
 
     def add_yum_repo(self, baseurl, repo_name='rhel', repo_desc='RHEL Base Repo'):
+        """
+
+        Args:
+            baseurl:
+            repo_name:
+            repo_desc:
+
+        Returns: sum of return codes
+
+        """
         _repo_file = f'/etc/yum.repos.d/{repo_name}.repo'
         _repo_config = [f'[{repo_name}]',
                         f'name = {repo_desc}',
@@ -1138,7 +1157,8 @@ class MultiTerm(object):
         for _txt_line in _repo_config:
             self.getoutput_thread(f'echo "{_txt_line}" >> {_repo_file}')
 
-        return self.getstatus_bool('yum clean all && yum install -y net-tools')
+        # return self.getstatus_bool('yum clean all && yum install -y net-tools')
+        return self.getstatus_sum('yum clean all && yum install -y net-tools')
 
 
 def ipcalc(address, netmask='24'):
@@ -1262,18 +1282,489 @@ def normalize_addr(*address):
         elif _addr.count('.') == 3:
             _return.append(_addr)
 
+        elif _addr == 'localhost':
+            _return.append(_addr)
+
     return _return
 
 
-class GpfsManager(object):
-    def __init__(self):
-        pass
+class GpfsManager(MultiTerm):
+    def __init__(self, hosts,
+                 *datacenter_and_hostnames,
+                 pri_node=None, sec_node=None,
+                 fs_name=None, mount_point=None,
+                 preview=True, debug=False):
+        """
+        Initiater IBM GPFS Cluster Configuration
+        Parameters:
+            hosts (tuple) - tuple of 4-tuple include host, user, password and port
+            debug (bool) - set to True display logs on monitor
+        """
+        # prefix of nodename append to hostname of OS
+        # prefix of heartbeats IP addresses
+        # prefix of management IP addresses
+        # read value from method verify_config()
+        self.node_prefix = self.hb_prefix = self.mgmt_ip_prefix = None
 
-    def verify_mgmt_ips(self):
-        pass
+        self.hostnames = self.nodenames = self.mgmt_ips = self.hb_ips = None
 
-    def verify_config(self):
-        pass
+        self.datacenter = [_dc_host.split(':')[0] for _dc_host in datacenter_and_hostnames]
+
+        num_of_datacenter = len(self.datacenter)
+        if num_of_datacenter <= 1:  # must have at least one disk share the same SCSI ID
+            pass
+
+        else:  # the disk belongs to the same DC must share the same SCSI ID
+            pass
+
+        self.stage = {
+            'verify_hosts': False,
+            'add_hosts': False,
+            'authorise_ssh': False,
+            'add_known_hosts': False,
+            'config_yum': False,
+            'inst_pkgs': False,
+            'inst_gpfs': False,
+            'build_module': False,
+            'append_path': False,
+            'create_cls_cfg': False,
+            'create_cls': False,
+            'accept_lns': False,
+            'startup_cls': False,
+            'create_nsd_cfg': False,
+            'create_nsd': False,
+            'add_tiebreaker': False,
+            'create_fs': False,
+            'mount_fs': False
+        }
+        self._stage_file = os.path.join(_HOME_, '_stage.yaml')
+
+        self.preview = preview
+
+        self.cls_cfg = []
+        self.node_file = '/etc/gpfs/node.cfg'
+
+        self.nsd_cfg = []
+        # self.nsd_cfg = {'mmfs1': }
+        self.stanzas_file = '/etc/gpfs/nsd.cfg'
+        self.tiebreaker_disks="gpfs1nsd;gpfs2nsd;gpfs3nsd"
+
+        self.fs_name = fs_name if fs_name is not None else DEF_FS_NAME
+        self.mount_point = mount_point if mount_point is not None else DEF_MOUNT_POINT
+
+        MultiTerm.__init__(self, hosts, debug=debug)
+
+        # primary node of the GPFS cluster
+        self.pri_node = pri_node if pri_node is not None else self.terms[0].getoutput('hostname')
+        self.sec_node = sec_node if sec_node is not None else self.terms[1].getoutput('hostname')
+
+        self.cls_name = f'{self.pri_node.strip(self.pri_node.strip(self.sec_node))}_cluster'
+
+        self.pri_term = None
+
+        for term in self.terms:
+            if term.host == self.pri_node or term.getoutput('hostname') == self.pri_node:
+                self.pri_term = term
+
+    def write_stage(self, key=None, value=False):
+        if key in self.stage.keys():
+            self.stage[key] = value
+
+        with open(self._stage_file, 'w') as f:
+            dump(self.stage, f)
+
+        return value
+
+    def recover_stage(self):
+        """
+        Read stage from file '_stage.yaml'
+        Returns: self.stage: dict
+        """
+        with open(self._stage_file, 'r+') as f:
+            self.stage = safe_load(f)
+
+        return self.stage
+
+    def verify_config(self,
+                      prod_addresses=None,
+                      heartbeats=None, heartbeats_prefix=None,
+                      hostnames=None,
+                      nodename_prefix=None):
+        """
+        Read addresses and names from parameters
+        Returns:
+            True if all addresses have been assigned to the hosts
+            and all hostnames are the same as the value of args.
+        """
+        if self.stage['verify_hosts']:
+            return True
+
+        assert heartbeats is not None or heartbeats_prefix is not None
+
+        prod_addresses = [] if prod_addresses is None else prod_addresses
+        heartbeats = [] if heartbeats is None else heartbeats
+        hostnames = [] if hostnames is None else hostnames
+
+        mgmt_addresses = []
+        _ = [mgmt_addresses.append(_term.host) if _term.host != 'localhost' else '' for _term in self.terms]
+
+        _return_code = 0
+        addrlist = []
+        hostname_list = [_name for _name in self.getoutput_thread('hostname').values()]
+
+        _ = [addrlist.extend(_addr.split('\n')) for _addr in
+             self.getoutput_thread('''ip a | grep -Eo "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"''').values()]
+
+        _return_code += 0 if set(prod_addresses).issubset(set(addrlist)) else 1
+        _return_code += 0 if set(heartbeats).issubset(set(addrlist)) else 1
+        _return_code += 0 if set(hostnames).issubset(set(hostname_list)) else 1
+
+        self.node_prefix = nodename_prefix if nodename_prefix is not None else DEF_NODE_PREFIX
+
+        # fetch prefix[ex] of heartbeats IP addresses
+        if heartbeats_prefix is not None:
+            self.hb_prefix = heartbeats_prefix
+        else:
+            self.hb_prefix = tuple(set(['.'.join(_addr.split('.')[0:2]) for _addr in heartbeats]))
+
+        # fetch prefix[es] of management IP addresses
+        self.mgmt_ip_prefix = tuple(set(['.'.join(_addr.split('.')[0:2]) for _addr in mgmt_addresses]))
+
+        if _return_code == 0:
+            self.hostnames = hostname_list
+            self.nodenames = [f'{self.node_prefix}{_name}' for _name in self.hostnames]
+            self.mgmt_ips = mgmt_addresses
+            self.hb_ips = []
+            _ = [self.hb_ips.append(_addr) if _addr.startswith(self.hb_prefix) else '' for _addr in addrlist]
+
+        return self.write_stage('verify_hosts', True) if _return_code == 0 else self.write_stage('verify_hosts', False)
+
+    def add_cls_hosts_db(self):
+        if self.stage['add_hosts']:
+            return True
+
+        _return_code = 0
+
+        if self.preview:
+
+            _title = 'Host Database Info'
+            print('-'*30, f'{_title:^20s}', '-'*30, sep='')
+            print(f'Management address: [{"|".join(self.mgmt_ips)}]\n'
+                  f'Heartbeats address: [{"|".join(self.hb_ips)}]\n'
+                  f'Hostnames: [{"|".join(self.hostnames)}]\n'
+                  f'Nodenames: [{"|".join(self.nodenames)}]\n')
+            return True
+
+        for _pre in self.mgmt_ip_prefix:
+            _return_code += sum(self.add_hosts_all(ip_prefix=_pre))
+
+        for _pre in self.hb_prefix:
+            _return_code += sum(self.add_hosts_all(ip_prefix=_pre,
+                                                   nodename_prefix=self.node_prefix))
+
+        return self.write_stage('add_hosts', True) if _return_code == 0 else self.write_stage('add_hosts', False)
+
+    def authorize_cls_ssh_all(self):
+        _stage_key = 'authorise_ssh'
+        if self.stage[_stage_key]:
+            return True
+
+        if self.preview:
+            _title = 'SSH Authorization'
+            print('-'*30, f'{_title:^20s}', '-'*30, sep='')
+            print('Key-based SSH authorization ignored as [preview] is set to True.')
+            return True
+
+        _return_code = sum(self.ssh_authorize_all())
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def add_cls_ssh_known_hosts(self):
+        _stage_key = 'add_known_hosts'
+        if self.stage[_stage_key]:
+            return True
+
+        _return_code = 0
+
+        if self.preview:
+            print(f'Addresses [{"|".join(self.hb_ips)}]\n'
+                  f'And nodenames [{"|".join(self.nodenames)}] will be appended to known_hosts.\n')
+            return True
+
+        for _pre in self.hb_prefix:
+            _return_code += sum(self.add_known_hosts_all(ip_prefix=_pre, nodename_prefix=self.node_prefix))
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def setup_cls_yum(self, baseurl, name=None, desc=None):
+        _stage_key = 'config_yum'
+        if self.stage[_stage_key]:
+            return True
+
+        if self.preview:
+            _title = 'YUM & Packages'
+            print('-'*30, f'{_title:^20s}', '-'*30, sep='')
+            print(f'Baseurl {baseurl}')
+            return True
+
+        _return_code = self.add_yum_repo(baseurl, repo_name=name, repo_desc=desc)
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def inst_cls_required_pkgs(self):
+        _stage_key = 'inst_pkgs'
+        _return_code = 0
+        if self.stage[_stage_key]:
+            return True
+
+        _required_pkgs = ['kernel-headers', 'kernel-devel', 'libgomp', 'glibc-headers', 'glibc-devel',
+                          'gcc', 'gcc-c++', 'libstdc++', 'cpp', 'binutils', 'm4', 'net-tools', 'ksh']
+
+        if self.preview:
+            print(f'Required packages: [{"|".join(_required_pkgs)}]')
+            return True
+
+        for _pkg in _required_pkgs:
+            _return_code += self.getstatus_sum(f'yum install -y {_pkg}')
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def inst_gpfs_rpm(self):
+        _stage_key = 'inst_gpfs'
+        _return_code = 0
+        if self.stage[_stage_key]:
+            return True
+
+        _gpfs_rpms = ['gpfs.adv*.rpm', 'gpfs.base*.rpm', 'gpfs.compression*.rpm', 'gpfs.crypto*.rpm',
+                      'gpfs.docs*.rpm', 'gpfs.gpl*.rpm', 'gpfs.gskit*.rpm', 'gpfs.license*.rpm', 'gpfs.msg*.rpm']
+        _gpfs_loc = '/usr/lpp/mmfs/*.*.*.*/gpfs_rpms'
+
+        if self.preview:
+            print(f'GPFS packages: [{"|".join(_gpfs_rpms)}]\n'
+                  f'GPFS rpm location: [{_gpfs_loc}]')
+            return True
+
+        for _rpm in _gpfs_rpms:
+            _return_code += self.getstatus_sum(f'rpm -ivh {_gpfs_loc}/{_rpm}')
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def build_gpfs(self):
+        _stage_key = 'build_module'
+        if self.stage[_stage_key]:
+            return True
+
+        if self.preview:
+            print('build GPFS kernel module ignored.\n')
+            return True
+
+        _return_code = self.getstatus_sum('/usr/lpp/mmfs/bin/mmbuildgpl')
+        _return_code += self.getstatus_sum('ls -l /lib/modules/`uname -r`/extra')
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def add_command_path(self):
+        _stage_key = 'append_path'
+        if self.stage[_stage_key]:
+            return True
+
+        _mmfs_path = '/usr/lpp/mmfs/bin'
+        _path_append = f'export PATH=$PATH:{_mmfs_path}'
+        _bash_pro = '~/.bash_profile'
+        _add_path_command = f"""if ! grep '{_mmfs_path}' {_bash_pro}; then echo '{_path_append}' >> {_bash_pro}; fi"""
+
+        if self.preview:
+            _title = 'Environment'
+            print('-' * 30, f'{_title:^20s}', '-' * 30, sep='')
+            print(f'GPFS bin path: [{_mmfs_path}]\n'
+                  f'Bash profile: [{_bash_pro}]\n'
+                  f'Command to append PATH: [{_add_path_command}]\n')
+            return True
+
+        _return_code = self.getstatus_sum(_add_path_command)
+        _return_code += self.getstatus_sum(f'source {_bash_pro}')
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, False)
+
+    def create_cls_cfg(self, *node_and_role):
+        """
+        Create GPFS cluster node configuration.
+        If nodes are quorum-manager, the left are noquorum-client
+        Args:
+            *node_and_role: node1:quorum-manager, node2:noquorum-client
+
+        Returns:
+
+        """
+        _stage_key = 'create_cls_cfg'
+        _return_code = 0
+
+        if self.stage[_stage_key]:
+            return True
+
+        for _node_str in node_and_role:
+            if ':' not in _node_str or '-' not in _node_str:
+                continue
+
+            self.cls_cfg.append(_node_str)
+
+        if node_and_role == ():
+            self.cls_cfg = [f"""{self.node_prefix}{_term.getoutput('hostname')}:quorum-manager""" for _term in self.terms[0:7]]
+            self.cls_cfg.extend([f"""{self.node_prefix}{_term.getoutput('hostname')}:quorum-manager""" for _term in self.terms[7:]])
+
+        if self.preview:
+            _title = 'GPFS Configuration'
+            print('-' * 30, f'{_title:^20s}', '-' * 30, sep='')
+            print(f'Node configuration: ')
+            _ = [print(f'\t{_line}') for _line in self.cls_cfg]
+            return True
+
+        for _txt_line in self.cls_cfg:
+            _code, _output = self.pri_term.getstatusoutput(f"""echo {_txt_line} >> {self.node_file}""")
+            _return_code += _code
+
+        return self.write_stage(_stage_key, True) if _return_code == 0 else self.write_stage(_stage_key, True)
+
+    def create_cls(self, node_file=None):
+        # NodeName:NodeDesignations:AdminNodeName
+        _stage_key = 'create_cls'
+        if self.stage[_stage_key]:
+            return True
+
+        node_file = self.node_file if node_file is None else node_file
+        _create_cls = f"""mmcrcluster -A -N {node_file} -p {self.pri_node} -s {self.sec_node} -r /usr/bin/ssh -R /usr/bin/scp -C {self.cls_name}"""
+
+        if self.preview:
+            print(f'Command creating cluster: [{_create_cls}]')
+            return True
+
+        _code, _output = self.pri_term.getstatusoutput(_create_cls)
+
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, True)
+
+    def accept_license(self, node_name=None):
+        _stage_key = 'accept_lns'
+        if self.stage[_stage_key]:
+            return True
+
+        node_name = 'all' if node_name is None else node_name
+        _accept_license = f"""mmchlicense server --accept -N {node_name}"""
+
+        if self.preview:
+            print(f'Command accepting license: [{_accept_license}]')
+            return True
+
+        _code, _output = self.pri_term.getstatusoutput(_accept_license)
+
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, False)
+
+    def create_nsd_cfg(self):
+        _stage_key = 'create_nsd_cfg'
+        if self.stage[_stage_key]:
+            return True
+
+        if self.preview:
+            print(f'NSD configuration:')
+            _ = [print(f'\t{_nsd}') for _nsd in self.nsd_cfg]
+            return True
+
+        # fixme
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, False)
+
+    def create_nsd(self, stanzas_file=None):
+        _stage_key = 'create_nsd'
+        if self.stage[_stage_key]:
+            return True
+
+        stanzas_file = stanzas_file if stanzas_file is not None else self.stanzas_file
+        _cr_nsd = f"""mmcrnsd -F {stanzas_file}"""
+
+        if self.preview:
+            print(f'Command creating NSD: [{_cr_nsd}]')
+            return True
+
+        _code, _output = self.pri_term.getstatusoutput(_cr_nsd)
+
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, False)
+
+    def config_tiebreak(self, tiebreaker_disks=None):
+        # tiebreakerDisks="gpfs1nsd;gpfs2nsd;gpfs3nsd"
+        _stage_key = 'add_tiebreaker'
+        if self.stage[_stage_key]:
+            return True
+
+        _disk = tiebreaker_disks if tiebreaker_disks is not None else self.tiebreaker_disks
+        _add_tie = f"""mmchconfig tiebreakerDisks={_disk}"""
+
+        if self.preview:
+            print(f'Tiebreaker disks: [{_disk}]')
+            print(f'Command modifying config: {_add_tie}')
+            return True
+
+        _code, _output = self.pri_term.getstatusoutput(_add_tie)
+
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, False)
+
+    def create_filesystem(self, fs_name=None, stanzas_file=None, block_size='4M', mount_point=None):
+        _stage_key = 'create_fs'
+        if self.stage[_stage_key]:
+            return True
+
+        fs_name = fs_name if fs_name is not None else self.fs_name
+        nsd_cfg = stanzas_file if stanzas_file is not None else self.stanzas_file
+        mount_point = mount_point if mount_point is not None else self.mount_point
+
+        _cr_fs = f"""mmcrfs {fs_name} -F {nsd_cfg} -A yes -B {block_size} -T {mount_point}"""
+
+        if self.preview:
+            print(f'Filesystem: [{fs_name}]')
+            print(f'Mount point: [{mount_point}]')
+            print(f'Command creating filesystem: [{_cr_fs}]')
+            return True
+
+        _code, _output = self.pri_term.getstatusoutput(_cr_fs)
+
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, False)
+
+    def mount_filesystem(self, fs_name, node_name=None):
+        _stage_key = 'mount_fs'
+        if self.stage[_stage_key]:
+            return True
+
+        fs_name = fs_name if fs_name is not None else 'all'
+        node_opts = '-a' if node_name is None else f'-N {node_name}'
+
+        _mount_fs = f"""mmmount {fs_name} {node_opts}"""
+
+        if self.preview:
+            print(f'Command mounting filesystem [{_mount_fs}]')
+            return True
+
+        _code, _output = self.pri_term.getstatusoutput(_mount_fs)
+
+        return self.write_stage(_stage_key, True) if _code == 0 else self.write_stage(_stage_key, False)
+
+    def all_in_one(self, recovery=False):
+        self.recover_stage() if recovery else ''
+
+        # verify configuration and read value for parameters
+        self.verify_config(heartbeats_prefix=('99', '199', ))
+        self.add_cls_hosts_db()
+        self.authorize_cls_ssh_all()
+        self.add_cls_ssh_known_hosts()
+        self.setup_cls_yum(baseurl='file:///media', name='cdrom', desc='ISO Base System')
+        self.inst_cls_required_pkgs()
+        self.inst_gpfs_rpm()
+        self.build_gpfs()
+        self.add_command_path()
+        self.create_cls_cfg()
+        self.create_cls()
+        self.accept_license()
+        self.create_nsd_cfg()
+        self.create_nsd()
+        self.config_tiebreak()
+        self.create_filesystem()
+        # self.mount_filesystem()
 
 
 def module_ipcalc(*args):
@@ -1382,18 +1873,31 @@ def module_multerm(*args):
             print(_output)
 
 
+def usage(module):
+    if module == 'ipcalc':
+        print(MODULE_IPCALC_USAGE)
+    elif module == 'ifcfg':
+        print(MODULE_IFCFG_USAGE)
+    elif module == 'multerm':
+        print(MODULE_IFCFG_USAGE)
+    elif module == 'gpfs':
+        print(MODULE_GPFS_USAGE)
+    else:
+        print(USAGE)
+    exit(0)
+
+
 _FILENAME_ = os.path.relpath(__file__)
-USAGE = f"""
-Usage:
-  {_FILENAME_} [module] [options] [action]
-  
+
+MODULE_IPCALC_USAGE = f"""
 Modules:
   ipcalc - calculate subnet for given <IP/Prefix> | [Netmask]
     {_FILENAME_} ipcalc 192.168.0.1/24
     {_FILENAME_} ipcalc 192.168.0.1 24
     {_FILENAME_} ipcalc 192.168.0.1/255.255.255.0
-    {_FILENAME_} ipcalc 192.168.0.1 255.255.255.0
-    
+    {_FILENAME_} ipcalc 192.168.0.1 255.255.255.0"""
+
+MODULE_IFCFG_USAGE = f"""
   ifcfg - automatically assign IP address[es] to the first suitable interface
     {_FILENAME_} ifcfg -h 192.168.1.1/2 -a 10.10.10.1/2=28 -g '10.10.10.14' -p 'SHARED_PASS' --default-route --restart-network
     {_FILENAME_} ifcfg 
@@ -1406,22 +1910,32 @@ Modules:
     {_FILENAME_} ifcfg 
         <-h HOST[s]> 
         [-u USER[s]] [-p PASSWORD[s]]
-        <-i interface> --show
-                    
-    
+        <-i interface> --show"""
+
+MODULE_GPFS_USAGE = f"""
   gpfs - create GPFS cluster, NSD, filesystem
     {_FILENAME_} gpfs 
         <-h HOST[s]> 
-        [-u USER[s]] [-p PASSWORD[s]]
-        [-s ADDRESSES] [-b HEARTBEATS] [-n HOSTNAMES] [-x PREFIX] 
+        [-u USER[s]] [-p PASSWORD[s]] [-s ADDRESSES] [-b HEARTBEATS]
+        <--hb-prefix STR>
+        [-n HOSTNAMES] [-x PREFIX] 
         [-f DIRECTORY] [-g MMFS] [-d /dev/sdx] 
         [-P PRIMARY] [-s SECONDARY] 
-        [--preview]
-        
+        [--preview]"""
+
+MODULE_MULTERM_USAGE = f"""
   multerm -- command line interface for fetching output of command from multiple hosts
     {_FILENAME_} multerm
         <-h HOST[s]>
-        [-u USER[s]] [-p PASSWORD[s]]  
+        [-u USER[s]] [-p PASSWORD[s]]"""
+
+USAGE = f"""
+Usage:
+  {_FILENAME_} [module] [options] [action]
+  {MODULE_IPCALC_USAGE}
+  {MODULE_IFCFG_USAGE}          
+  {MODULE_GPFS_USAGE}
+  {MODULE_MULTERM_USAGE}
 
 Options:
 
@@ -1448,9 +1962,11 @@ Options:
   -b HEARTBEATS         heartbeats IP addresses '192.168.1.1/2, 192.168.2.1/2'
                         prefix of address such as '192.168' is acceptable for verifying network configuration
                         both of prefix and full address are used to identified host, assigning IP with '-a' option
+  --hb-prefix STR       prefix of heartbeats IP addresses for all hosts in the cluster
+  
   -n [DC:]HOST[/HOST]   hostnames 'DATACENTER1:host1/host2, DATACENTER2:host3/host4'
                         for double checking host configuration, never try to set hostname here
-  -x PREFIX             nodename prefix, append to the beginning of the OS hostname 'prefix-'
+  -x NODENAME_PREFIX    nodename prefix, append to the beginning of the OS hostname 'prefix-'
                         this option overwrite the global parameter defined at the beginning 
                         
   -m MOUNT_POINT        GPFS filesystem mount point
@@ -1465,7 +1981,6 @@ Actions:
   --show                display NICs configuration
   --preview             preview generated configuration for GPFS installation
   --help                print help messages and exit
-
 """
 
 
@@ -1475,6 +1990,7 @@ def read_args():
     ip_user_pass = None
 
     hosts = passwords = addresses = []
+    passwords = ['']
     users = ['root']
     gateways = ''
     default_route = False
@@ -1484,10 +2000,13 @@ def read_args():
     show = False
 
     service_ips = heartbeats_ips = hostnames = []
-    prefix = NODE_PREFIX
+    node_prefix = NODE_PREFIX
+    hb_prefix = None
 
     mount_point = fs_name = disk = None
     pri_node = sec_node = q_node = None
+
+    HELP = False
 
     try:
         module = sys.argv[1]
@@ -1498,14 +2017,15 @@ def read_args():
         opts, args = getopt.getopt(options,
                                    'h:u:p:a:g:s:b:n:x:f:m:d:P:S:Q:rwi:o',
                                    ['preview', 'help', 'default-route',
-                                    'restart-network', 'show', 'bond'])
+                                    'restart-network', 'show', 'bond',
+                                    'hb-prefix'])
 
         for _opt, _arg in opts:
-            _arg_list = _arg.split(',')
+            _arg_list = [_a.strip() for _a in _arg.split(',')]
             if _opt == '-h':
                 hosts = normalize_addr(*_arg_list)
             elif _opt == '-u':
-                users = [_usr.strip() for _usr in _arg_list]
+                users = _arg_list
             elif _opt == '-p':
                 passwords = _arg.split()
             elif _opt == '-a':
@@ -1526,10 +2046,12 @@ def read_args():
                 service_ips = normalize_addr(*_arg_list)
             elif _opt == '-b':
                 heartbeats_ips = normalize_addr(*_arg_list)
+            elif _opt == '--hb-prefix':
+                hb_prefix = _arg
             elif _opt == '-n':
                 hostnames = _arg
             elif _opt == '-x':
-                prefix = _arg
+                node_prefix = _arg
             elif _opt == '-m':
                 mount_point = _arg
             elif _opt == '-f':
@@ -1545,10 +2067,12 @@ def read_args():
             elif _opt == '--preview':
                 PREVIEW = True
             elif _opt == '--help':
-                print(USAGE)
+                HELP = True
 
         if module in ['-h', '--help', 'help', 'h']:
             print(USAGE)
+
+        usage(module=module) if HELP else None
 
         if module == 'ipcalc':
             module_ipcalc(sys.argv[2])
@@ -1559,7 +2083,7 @@ def read_args():
                   passwords[_i] if len(passwords) > 1 else passwords[0])
                  for _i in range(len(hosts))
                  ]
-            )
+            )  # todo add support for specifying SSH port
         except IndexError:
             print(USAGE)
             exit(1)
@@ -1618,6 +2142,4 @@ def read_args():
 
 if __name__ == '__main__':
     read_args()
-
-
 
